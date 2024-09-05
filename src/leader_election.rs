@@ -1,20 +1,19 @@
 use crate::error::Result;
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use std::{
-    future::Future,
-    ops::ControlFlow,
-    time::Duration,
-};
+use std::{future::Future, ops::ControlFlow, time::Duration};
 use tokio::{
-    select,
-    sync::mpsc::UnboundedReceiver,
+    select, spawn,
+    sync::mpsc::{self, UnboundedReceiver},
     time::{interval, sleep, timeout},
 };
-use worterbuch_client::{
-    topic, TypedStateEvent, TypedStateEvents,
-    Worterbuch,
-};
+use worterbuch_client::{topic, TypedStateEvent, TypedStateEvents, Worterbuch};
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum LeaderState {
+    Leader,
+    Follower,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,7 +22,7 @@ struct Vote {
     term: u64,
 }
 
-enum State {
+enum ElectionState {
     Leader,
     Follower,
     Candidate,
@@ -38,7 +37,10 @@ struct Election {
     new_leader: Option<Box<str>>,
 }
 
-struct LeaderElection<S: FnMut(), F: Future + Unpin> {
+struct LeaderElection<
+    S: FnMut() + Send + Sync + 'static,
+    F: Future<Output: Send> + Unpin + Send + Sync + 'static,
+> {
     // constants
     wb: Worterbuch,
     group_name: Box<str>,
@@ -51,9 +53,10 @@ struct LeaderElection<S: FnMut(), F: Future + Unpin> {
     min_delay: u64,
     max_delay: u64,
     heartbeat: u64,
+    leader_event_tx: mpsc::Sender<LeaderState>,
 
     // mutable state
-    state: State,
+    state: ElectionState,
     leader_id: Option<Box<str>>,
     term: u64,
 
@@ -62,7 +65,11 @@ struct LeaderElection<S: FnMut(), F: Future + Unpin> {
     heartbeats: UnboundedReceiver<TypedStateEvents<usize>>,
 }
 
-impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
+impl<
+        S: FnMut() + Send + Sync + 'static,
+        F: Future<Output: Send> + Unpin + Send + Sync + 'static,
+    > LeaderElection<S, F>
+{
     async fn new(
         namespace: Option<Box<str>>,
         wb: Worterbuch,
@@ -74,12 +81,14 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
         heartbeat: u64,
         request_shutdown: S,
         on_shutdown_requested: F,
+        leader_event_tx: mpsc::Sender<LeaderState>,
     ) -> Result<Self> {
-        let root_key:Box<str> = format!(
+        let root_key: Box<str> = format!(
             "{}/{}",
             namespace.unwrap_or("leader/election".into()),
             group_name
-        ).into();
+        )
+        .into();
         let election_key: Box<str> = format!("{}/{}", root_key, instance_id).into();
 
         let (votes, _) = wb.subscribe::<Vote>(topic!(root_key), true, true).await?;
@@ -97,7 +106,7 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
             quorum,
             root_key,
             election_key,
-            state: State::Candidate,
+            state: ElectionState::Candidate,
             leader_id: None,
             min_delay,
             max_delay,
@@ -105,10 +114,11 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
             term: 0,
             votes,
             heartbeats,
+            leader_event_tx,
         })
     }
 
-    async fn start(mut self) -> Result<()> {
+    async fn start(mut self) {
         log::info!(
             "Participating in leader election for group '{}' as instance '{}' …",
             self.group_name,
@@ -120,20 +130,22 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
         log::debug!("max delay:\t{}", self.max_delay);
         log::debug!("heartbeat:\t{}", self.heartbeat);
 
-        self.run().await?;
-        Ok(())
+        if let Err(e) = self.run().await {
+            log::error!("Error in leader election: {e}");
+            (self.request_shutdown)();
+        }
     }
 
     async fn run(&mut self) -> Result<()> {
         loop {
             match &self.state {
-                State::Leader => self.lead().await?,
-                State::Follower => self.follow().await?,
-                State::Candidate => self.start_election().await?,
-                State::Stopped => {
+                ElectionState::Leader => self.lead().await?,
+                ElectionState::Follower => self.follow().await?,
+                ElectionState::Candidate => self.start_election().await?,
+                ElectionState::Stopped => {
                     (self.request_shutdown)();
                     break;
-                },
+                }
             }
         }
 
@@ -159,7 +171,7 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
             'election: loop {
                 select! {
                     _ = &mut self.on_shutdown_requested => {
-                        self.state = State::Stopped;
+                        self.state = ElectionState::Stopped;
                         break 'election;
                     },
                     _ = sleep(Duration::from_millis(delay as u64)) => {
@@ -190,7 +202,7 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
                             },
                         }
                     } else {
-                        break 'election; 
+                        break 'election;
                     },
                     recv = self.heartbeats.recv() => match recv {
                         Some(es) => {
@@ -212,7 +224,7 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
                                                     log::info!("Apparently that was me. Bye.");
                                                     (self.request_shutdown)();
                                                 }else {
-                                                    self.state = State::Candidate;
+                                                    self.state = ElectionState::Candidate;
                                                     break 'election;
                                                 }
                                             }
@@ -238,19 +250,19 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
         if election.timed_out {
             log::info!("Starting new election term …");
             self.leader_id = None;
-            self.state = State::Candidate;
+            self.state = ElectionState::Candidate;
         } else if election.votes_in_my_favor >= self.quorum {
             log::info!("We won the election.");
             self.leader_id = Some(self.instance_id.clone());
-            self.state = State::Leader;
+            self.state = ElectionState::Leader;
         } else if let Some(leader) = election.new_leader {
             log::info!("Instance '{leader}' won the election.");
             self.leader_id = Some(leader);
-            self.state = State::Follower;
+            self.state = ElectionState::Follower;
         } else {
             log::info!("Election was tied. Starting new term …");
             self.leader_id = None;
-            self.state = State::Candidate;
+            self.state = ElectionState::Candidate;
         }
 
         Ok(())
@@ -293,16 +305,17 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
     }
 
     async fn follow(&mut self) -> Result<()> {
+        self.leader_event_tx.send(LeaderState::Follower).await?;
 
         'follow: loop {
             select! {
                 _ = &mut self.on_shutdown_requested => {
-                    self.state = State::Stopped;
+                    self.state = ElectionState::Stopped;
                     break 'follow;
                 },
                 _ = sleep(Duration::from_millis((2 * self.heartbeat) as u64)) => {
                     log::info!("Did not receive heartbeat from leader, starting new election …");
-                    self.state = State::Candidate;
+                    self.state = ElectionState::Candidate;
                     break 'follow;
                 },
                 _ = self.votes.recv() => (),
@@ -315,7 +328,7 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
                                         let leader: &str = leader.as_ref();
                                         if kvp.key.ends_with(leader) {
                                             log::info!("The current leader died.");
-                                            self.state = State::Candidate;
+                                            self.state = ElectionState::Candidate;
                                             break 'follow;
                                         }
                                     }
@@ -333,6 +346,8 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
     }
 
     async fn lead(&mut self) -> Result<()> {
+        self.leader_event_tx.send(LeaderState::Leader).await?;
+
         self.wb
             .set_grave_goods(&[&topic!(self.election_key)])
             .await?;
@@ -343,7 +358,7 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
         'lead: loop {
             select! {
                 _ = &mut self.on_shutdown_requested => {
-                    self.state = State::Stopped;
+                    self.state = ElectionState::Stopped;
                     break 'lead;
                 },
                 _ = interval.tick() => {
@@ -361,7 +376,7 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
                                             log::info!("The current leader died.");
                                             if leader == self.instance_id.as_ref() {
                                                 log::info!("Apparently that was me. Bye.");
-                                                self.state = State::Stopped;
+                                                self.state = ElectionState::Stopped;
                                                 return Ok(());
                                             }
                                         }
@@ -380,7 +395,10 @@ impl<S: FnMut(), F: Future + Unpin> LeaderElection<S, F> {
     }
 }
 
-pub async fn elect_leader<'a, S: FnMut(), F: Future + Unpin + 'a>(
+pub async fn elect_leader<
+    S: FnMut() + Send + Sync + 'static,
+    F: Future<Output: Send> + Unpin + Send + Sync + 'static,
+>(
     namespace: Option<Box<str>>,
     wb: Worterbuch,
     instance_id: Box<str>,
@@ -391,7 +409,9 @@ pub async fn elect_leader<'a, S: FnMut(), F: Future + Unpin + 'a>(
     heartbeat: u64,
     request_shutdown: S,
     on_shutdown_requested: F,
-) -> Result<()> {
+) -> Result<mpsc::Receiver<LeaderState>> {
+    let (leader_event_tx, rx) = mpsc::channel(1);
+
     let le = LeaderElection::new(
         namespace,
         wb,
@@ -403,8 +423,11 @@ pub async fn elect_leader<'a, S: FnMut(), F: Future + Unpin + 'a>(
         heartbeat,
         request_shutdown,
         on_shutdown_requested,
+        leader_event_tx,
     )
     .await?;
 
-    le.start().await
+    spawn(le.start());
+
+    Ok(rx)
 }

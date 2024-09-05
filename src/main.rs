@@ -2,10 +2,13 @@ mod error;
 mod leader_election;
 
 use clap::Parser;
-use leader_election::elect_leader;
+use leader_election::*;
 use miette::{miette, IntoDiagnostic, Result};
 use std::{env, io, time::Duration};
-use tokio::{select, sync::oneshot};
+use tokio::{
+    select,
+    sync::{mpsc, oneshot},
+};
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle, Toplevel};
 use tracing_subscriber::filter::EnvFilter;
 use worterbuch_client::{config::Config, AuthToken};
@@ -118,18 +121,36 @@ async fn leader_election(subsys: SubsystemHandle) -> Result<()> {
         .or(args.heartbeat)
         .unwrap_or(500);
 
-    let on_shutdown_requested = Box::pin(async {
-        select! {
-            _ = subsys.on_shutdown_requested() => (),
-            _ = on_wb_disconnected => (),
-        }
-    });
+    let (osdr_tx, on_shutdown_requested) = oneshot::channel::<()>();
+    subsys.start(SubsystemBuilder::new(
+        "on-shutdown-requested",
+        |s| async move {
+            select! {
+                _ = s.on_shutdown_requested() => (),
+                _ = on_wb_disconnected => (),
+            }
+            osdr_tx.send(()).ok();
+            Ok(()) as Result<()>
+        },
+    ));
 
     let instance_id = env::var("ELECTION_INSTANCE_ID")
         .unwrap_or(wb.client_id().to_owned())
         .into();
 
-    elect_leader(
+    let (rqstshtdn_tx, mut rqstshtdn_rx) = mpsc::unbounded_channel();
+
+    subsys.start(SubsystemBuilder::new("request-shutdown", |s| async move {
+        rqstshtdn_rx.recv().await;
+        s.request_shutdown();
+        Ok(()) as Result<()>
+    }));
+
+    let request_shutdown = move || {
+        rqstshtdn_tx.send(()).ok();
+    };
+
+    let mut leader_changes = elect_leader(
         namespace,
         wb,
         instance_id,
@@ -138,11 +159,15 @@ async fn leader_election(subsys: SubsystemHandle) -> Result<()> {
         min_delay,
         max_delay,
         heartbeat,
-        || subsys.request_shutdown(),
+        request_shutdown,
         on_shutdown_requested,
     )
     .await
     .into_diagnostic()?;
+
+    while let Some(e) = leader_changes.recv().await {
+        log::info!("{e:?}");
+    }
 
     Ok(())
 }
